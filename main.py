@@ -1,89 +1,65 @@
 import os
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+import requests
+from fastapi import FastAPI, Request
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-
-# ========================
-# Environment Variables
-# ========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a professional product manager. Answer in a calm, structured, and actionable style.")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not set")
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY or not SYSTEM_PROMPT:
+    raise ValueError("Missing environment variables")
 
-# ========================
-# Load DeepSeek-R1 / Distill LLaMA Model Locally
-# ========================
-MODEL_NAME = "DeepSeek-R1"  # Or local path if uploaded
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
 
-print("Loading DeepSeek-R1 model locally. This may take a minute...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-print("Model loaded successfully!")
+app = FastAPI()
+user_memory = {}
 
-# ========================
-# Conversation Memory
-# ========================
-user_histories = {}
+def ask_gemini(user_id: int, message: str) -> str:
+    history = user_memory.get(user_id, [])
+    history.append({"role": "user", "parts": [{"text": message}]})
 
-# ========================
-# Local Model Function
-# ========================
-def ask_local(user_id: int, user_input: str) -> str:
-    if user_id not in user_histories:
-        user_histories[user_id] = [SYSTEM_PROMPT]
+    contents = [{"role": "user", "parts": [{"text": SYSTEM_PROMPT}]}] + history
 
-    # Add user message
-    user_histories[user_id].append(user_input)
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.5,
+            "maxOutputTokens": 500
+        }
+    }
 
-    # Prepare prompt
-    prompt = "\n".join(user_histories[user_id]) + "\nAssistant:"
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=200, do_sample=True, temperature=0.7)
-
-    reply = tokenizer.decode(output[0], skip_special_tokens=True)
-    # Keep only assistant reply
-    reply = reply.replace(prompt, "").strip()
-
-    # Save assistant reply
-    user_histories[user_id].append(reply)
-    return reply
-
-# ========================
-# Telegram Handlers
-# ========================
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Hello! I'm June, your PM assistant. Ask me anything about product strategy, roadmaps, or execution."
+    response = requests.post(
+        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+        json=payload,
+        timeout=20
     )
 
-def handle_message(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    user_input = update.message.text
+    reply = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    history.append({"role": "model", "parts": [{"text": reply}]})
+    user_memory[user_id] = history[-10:]  # keep memory short
 
-    reply = ask_local(user_id, user_input)
-    update.message.reply_text(reply)
+    return reply
 
-# ========================
-# Main Function
-# ========================
-def main():
-    updater = Updater(TELEGRAM_TOKEN)
-    dp = updater.dispatcher
+@app.post("/webhook")
+async def telegram_webhook(req: Request):
+    data = await req.json()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    if "message" not in data:
+        return {"ok": True}
 
-    print("June Telegram Bot is running locally on DeepSeek-R1...")
-    updater.start_polling()
-    updater.idle()
+    chat_id = data["message"]["chat"]["id"]
+    text = data["message"].get("text", "")
+    user_id = data["message"]["from"]["id"]
 
-if __name__ == "__main__":
-    main()
+    reply = ask_gemini(user_id, text)
+
+    requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": reply}
+    )
+
+    return {"ok": True}
